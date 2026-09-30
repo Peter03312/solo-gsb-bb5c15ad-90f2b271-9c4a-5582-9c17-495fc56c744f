@@ -79,6 +79,33 @@ CREATE TABLE IF NOT EXISTS points (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_points_trip_ts
     ON points(trip_id, ts_epoch);
 CREATE INDEX IF NOT EXISTS idx_points_trip ON points(trip_id, ts_epoch);
+
+-- 跨修订号差异核对：首次请求时冻结的"两版共同输入"快照。
+-- 轨迹点整份复制（轨迹内容不可变，这里同时防御未来出现删除路径）；
+-- 区域侧依赖 zone_versions 的不可变性，两版 as-of 视图无需另存。
+CREATE TABLE IF NOT EXISTS crossing_diff_snapshots (
+    snapshot_id  TEXT PRIMARY KEY,
+    old_revision INTEGER NOT NULL,
+    new_revision INTEGER NOT NULL,
+    since_epoch  REAL,
+    until_epoch  REAL,
+    since_iso    TEXT,
+    until_iso    TEXT,
+    page_size    INTEGER NOT NULL,
+    created_at   TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS crossing_diff_snapshot_points (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    snapshot_id TEXT NOT NULL REFERENCES crossing_diff_snapshots(snapshot_id),
+    trip_id     TEXT NOT NULL,
+    point_id    TEXT NOT NULL,
+    ts_epoch    REAL NOT NULL,
+    x           REAL NOT NULL,
+    y           REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_cdsp_snap_trip
+    ON crossing_diff_snapshot_points(snapshot_id, trip_id, ts_epoch);
 """
 
 
@@ -371,6 +398,78 @@ class Database:
         conn.executemany(
             "INSERT INTO points(trip_id, point_id, ts_epoch, x, y) VALUES (?,?,?,?,?)",
             rows,
+        )
+
+    # ----- 跨修订号差异核对快照 --------------------------------------------
+
+    def insert_crossing_diff_snapshot(
+        self,
+        conn: sqlite3.Connection,
+        snapshot_id: str,
+        old_revision: int,
+        new_revision: int,
+        since_epoch: Optional[float],
+        until_epoch: Optional[float],
+        since_iso: Optional[str],
+        until_iso: Optional[str],
+        page_size: int,
+        created_iso: str,
+    ) -> None:
+        """登记差异核对快照，并把首次请求时已存的全部轨迹点整份冻结。
+
+        必须在写事务内调用；区域侧由不可变的 zone_versions 提供稳定 as-of 视图。
+        """
+        conn.execute(
+            "INSERT INTO crossing_diff_snapshots"
+            "(snapshot_id, old_revision, new_revision, since_epoch, until_epoch, "
+            " since_iso, until_iso, page_size, created_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?)",
+            (
+                snapshot_id,
+                old_revision,
+                new_revision,
+                since_epoch,
+                until_epoch,
+                since_iso,
+                until_iso,
+                page_size,
+                created_iso,
+            ),
+        )
+        conn.execute(
+            "INSERT INTO crossing_diff_snapshot_points"
+            "(snapshot_id, trip_id, point_id, ts_epoch, x, y) "
+            "SELECT ?, trip_id, point_id, ts_epoch, x, y FROM points",
+            (snapshot_id,),
+        )
+
+    def get_crossing_diff_snapshot(
+        self, conn: sqlite3.Connection, snapshot_id: str
+    ) -> Optional[sqlite3.Row]:
+        return conn.execute(
+            "SELECT * FROM crossing_diff_snapshots WHERE snapshot_id = ?",
+            (snapshot_id,),
+        ).fetchone()
+
+    def list_snapshot_trip_ids(self, conn: sqlite3.Connection, snapshot_id: str) -> List[str]:
+        return [
+            row["trip_id"]
+            for row in conn.execute(
+                "SELECT DISTINCT trip_id FROM crossing_diff_snapshot_points "
+                "WHERE snapshot_id = ? ORDER BY trip_id",
+                (snapshot_id,),
+            ).fetchall()
+        ]
+
+    def list_snapshot_trip_points(
+        self, conn: sqlite3.Connection, snapshot_id: str, trip_id: str
+    ) -> List[sqlite3.Row]:
+        return list(
+            conn.execute(
+                "SELECT point_id, ts_epoch, x, y FROM crossing_diff_snapshot_points "
+                "WHERE snapshot_id = ? AND trip_id = ? ORDER BY ts_epoch, point_id",
+                (snapshot_id, trip_id),
+            )
         )
 
 

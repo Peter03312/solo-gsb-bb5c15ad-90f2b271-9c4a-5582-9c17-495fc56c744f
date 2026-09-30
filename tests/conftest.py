@@ -19,6 +19,8 @@ def _clean_tables():
     from app.main import db as _db
 
     with _db.transaction() as conn:
+        conn.execute("DELETE FROM crossing_diff_snapshot_points")
+        conn.execute("DELETE FROM crossing_diff_snapshots")
         conn.execute("DELETE FROM zone_version_windows")
         conn.execute("DELETE FROM zone_versions")
         conn.execute("DELETE FROM revisions")

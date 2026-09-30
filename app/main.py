@@ -11,7 +11,7 @@ from fastapi.responses import JSONResponse
 from .config import get_settings
 from .db import Database
 from .schemas import PointBatch, ZoneCreate
-from .service import AuditService, ConflictError, NotFoundError, ValidationError
+from .service import AuditService, ConflictError, CursorError, NotFoundError, ValidationError
 
 settings = get_settings()
 db = Database(settings)
@@ -50,6 +50,11 @@ async def _not_found_handler(_: Request, exc: NotFoundError) -> JSONResponse:
     return JSONResponse(status_code=404, content={"error": "not_found", "detail": str(exc)})
 
 
+@app.exception_handler(CursorError)
+async def _cursor_handler(_: Request, exc: CursorError) -> JSONResponse:
+    return JSONResponse(status_code=400, content={"error": "invalid_cursor", "detail": str(exc)})
+
+
 @app.get("/health")
 def health() -> dict:
     return {"status": "ok"}
@@ -69,6 +74,7 @@ def index() -> dict:
             "POST /api/v1/trips/{trip_id}/points",
             "GET  /api/v1/trips/{trip_id}",
             "GET  /api/v1/trips/{trip_id}/crossings",
+            "GET  /api/v1/crossing-diffs",
         ],
     }
 
@@ -153,6 +159,31 @@ def get_crossings(
 ) -> dict:
     return service.query_crossings(
         trip_id, zone_id=zone_id, since=since, until=until, revision=revision
+    )
+
+
+@app.get("/api/v1/crossing-diffs")
+def get_crossing_diffs(
+    old_revision: int = Query(..., ge=1, description="较小的旧全局修订号（正整数）"),
+    new_revision: int = Query(..., ge=1, description="较大的新全局修订号（正整数，须大于旧号）"),
+    since: Optional[str] = Query(
+        default=None, description="可选 UTC 核算时段起点（含），ISO 8601 且必须带时区"
+    ),
+    until: Optional[str] = Query(
+        default=None, description="可选 UTC 核算时段终点（不含），ISO 8601 且必须带时区"
+    ),
+    page_size: int = Query(default=100, ge=1, le=1000, description="每页条目数（1..1000）"),
+    cursor: Optional[str] = Query(
+        default=None, description="后续页游标：取上一页响应的 next_cursor，参数须与首次请求一致"
+    ),
+) -> dict:
+    return service.query_crossing_diffs(
+        old_revision=old_revision,
+        new_revision=new_revision,
+        since=since,
+        until=until,
+        page_size=page_size,
+        cursor=cursor,
     )
 
 

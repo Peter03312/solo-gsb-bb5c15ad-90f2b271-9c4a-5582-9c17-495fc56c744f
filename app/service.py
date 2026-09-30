@@ -1,8 +1,11 @@
 """业务服务：危险区登记、轨迹点批量提交、穿越审计计算。"""
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 import math
+import secrets
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -11,6 +14,9 @@ from shapely.geometry import Polygon
 from .db import Database
 from .geometry import GeometryError, build_polygon, merge_intervals, segment_inside_params
 from .timeutils import TimeError, clip_intervals_halfopen, merge_windows, parse_utc, validate_window
+
+# 分页大小上界，避免单次请求核算过多（车次 × 区域）
+MAX_DIFF_PAGE_SIZE = 1000
 
 
 class ConflictError(Exception):
@@ -23,6 +29,10 @@ class ValidationError(Exception):
 
 class NotFoundError(Exception):
     """资源/版本不存在（HTTP 404）。"""
+
+
+class CursorError(Exception):
+    """差异核对分页游标失效或与请求参数不匹配（HTTP 400）。"""
 
 
 def _iso_z(dt: datetime) -> str:
@@ -386,10 +396,7 @@ class AuditService:
 
         zone_results: List[Dict[str, Any]] = []
         for snap in snapshots:
-            polygon = Polygon(snap["exterior"], snap["holes"])
-            windows = merge_windows(snap["windows"])
-
-            result = self._cross_one_zone(points, polygon, windows, lo, hi)
+            result = self._compute_crossing(points, snap, lo, hi)
             result["zone_id"] = snap["zone_id"]
             zone_results.append(result)
 
@@ -401,6 +408,25 @@ class AuditService:
         if revision is not None:
             response["revision"] = revision
         return response
+
+    @staticmethod
+    def _empty_crossing() -> Dict[str, Any]:
+        return {"crossed": False, "total_duration_sec": 0, "segments": []}
+
+    def _compute_crossing(
+        self,
+        points: List[Any],
+        snapshot: Dict[str, Any],
+        lo: Optional[float],
+        hi: Optional[float],
+    ) -> Dict[str, Any]:
+        """按一份区域快照（几何 + 生效时段）核算单区穿越结论。
+
+        供单车次穿越查询与跨修订号差异核对共用，保证两者契约完全一致。
+        """
+        polygon = Polygon(snapshot["exterior"], snapshot["holes"])
+        windows = merge_windows(snapshot["windows"])
+        return self._cross_one_zone(points, polygon, windows, lo, hi)
 
     def _cross_one_zone(
         self,
@@ -451,3 +477,279 @@ class AuditService:
             "total_duration_sec": total,
             "segments": segments,
         }
+
+    # ------------------------------------------------------------------
+    # 两次全局修订号之间的穿越结论差异核对
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _encode_cursor(snapshot_id: str, last_trip_id: str, last_zone_id: str) -> str:
+        raw = json.dumps(
+            {"s": snapshot_id, "t": last_trip_id, "z": last_zone_id},
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+    @staticmethod
+    def _decode_cursor(cursor: str) -> Tuple[str, str, str]:
+        if not isinstance(cursor, str) or not cursor.strip():
+            raise CursorError("游标失效：游标必须是非空字符串")
+        cursor = cursor.strip()
+        try:
+            padded = cursor + "=" * (-len(cursor) % 4)
+            raw = base64.urlsafe_b64decode(padded.encode("ascii"))
+            data = json.loads(raw.decode("utf-8"))
+            snapshot_id = data["s"]
+            last_trip_id = data["t"]
+            last_zone_id = data["z"]
+        except (binascii.Error, ValueError, KeyError, UnicodeDecodeError) as exc:
+            raise CursorError("游标失效：无法解析（可能被截断或篡改）") from exc
+        if not all(isinstance(v, str) for v in (snapshot_id, last_trip_id, last_zone_id)):
+            raise CursorError("游标失效：游标内容格式不正确")
+        return snapshot_id, last_trip_id, last_zone_id
+
+    def query_crossing_diffs(
+        self,
+        old_revision: int,
+        new_revision: int,
+        since: Optional[str] = None,
+        until: Optional[str] = None,
+        page_size: int = 100,
+        cursor: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """核对两个全局修订号之间已存车次穿越结论的变化。
+
+        首次请求（无 cursor）时冻结当时已存的全部轨迹点作为两版共同输入；
+        后续页凭游标复用同一快照，新上传轨迹或新登记区域不改变结果。
+        区域按各自截至 old/new 修订号的最后版本核算，旧版尚未登记的区域按空结果比较。
+        """
+        # ---- 参数解析与校验 ----
+        for name, value in (("old_revision", old_revision), ("new_revision", new_revision)):
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValidationError(f"{name} 必须是正整数")
+        if old_revision >= new_revision:
+            raise ValidationError(
+                f"修订号顺序错误：old_revision（{old_revision}）必须小于 "
+                f"new_revision（{new_revision}）"
+            )
+        try:
+            lo = parse_utc(since, field="since").timestamp() if since else None
+            hi = parse_utc(until, field="until").timestamp() if until else None
+        except TimeError as exc:
+            raise ValidationError(str(exc)) from exc
+        if lo is not None and hi is not None and lo >= hi:
+            raise ValidationError("since 必须早于 until（核算时段为半开 [since, until)）")
+        if isinstance(page_size, bool) or not isinstance(page_size, int) or not (
+            1 <= page_size <= MAX_DIFF_PAGE_SIZE
+        ):
+            raise ValidationError(f"page_size 必须是 1..{MAX_DIFF_PAGE_SIZE} 之间的整数")
+        since_iso = _iso_z(datetime.fromtimestamp(lo, timezone.utc)) if lo is not None else None
+        until_iso = _iso_z(datetime.fromtimestamp(hi, timezone.utc)) if hi is not None else None
+
+        if cursor is not None:
+            snap_id, last_trip, last_zone = self._decode_cursor(cursor)
+            with self.db.read_transaction() as conn:
+                snap = self.db.get_crossing_diff_snapshot(conn, snap_id)
+                if snap is None:
+                    raise CursorError("游标失效：快照不存在或已过期，请不带游标重新发起首次请求")
+                # 后续页参数必须与首次请求逐一匹配
+                if not (
+                    snap["old_revision"] == old_revision
+                    and snap["new_revision"] == new_revision
+                    and snap["page_size"] == page_size
+                    and _epoch_equal(snap["since_epoch"], lo)
+                    and _epoch_equal(snap["until_epoch"], hi)
+                ):
+                    raise CursorError(
+                        "游标与请求参数不匹配：后续页必须沿用首次请求的 old_revision/"
+                        "new_revision/since/until/page_size"
+                    )
+                # 修订号存在性已在首次请求时校验；区域 as-of 视图由不可变历史版本冻结，
+                # 快照存在即可安全翻页，无需再比对当前最大修订号
+                items, next_cursor = self._scan_diff_page(
+                    conn,
+                    snap_id=snap_id,
+                    old_revision=old_revision,
+                    new_revision=new_revision,
+                    lo=lo,
+                    hi=hi,
+                    page_size=page_size,
+                    start_after=(last_trip, last_zone),
+                )
+            return {
+                "old_revision": old_revision,
+                "new_revision": new_revision,
+                "since": snap["since_iso"],
+                "until": snap["until_iso"],
+                "page_size": page_size,
+                "snapshot_id": snap_id,
+                "items": items,
+                "next_cursor": next_cursor,
+            }
+
+        # ---- 首次请求：校验修订号存在性并冻结轨迹快照 ----
+        created_iso = _iso_z(datetime.now(timezone.utc))
+        with self.db.transaction() as conn:
+            current = self.db.current_revision(conn)
+            if current == 0:
+                raise NotFoundError("尚无任何区域登记，修订号不存在: 0")
+            if new_revision > current:
+                raise NotFoundError(
+                    f"修订号超出当前范围: new_revision={new_revision}，当前最大修订号={current}"
+                )
+            # 24 字节随机 ID；主键约束兜底（碰撞时整个事务回滚，调用方重试即可）
+            snap_id = secrets.token_urlsafe(18)
+            self.db.insert_crossing_diff_snapshot(
+                conn,
+                snapshot_id=snap_id,
+                old_revision=old_revision,
+                new_revision=new_revision,
+                since_epoch=lo,
+                until_epoch=hi,
+                since_iso=since_iso,
+                until_iso=until_iso,
+                page_size=page_size,
+                created_iso=created_iso,
+            )
+            items, next_cursor = self._scan_diff_page(
+                conn,
+                snap_id=snap_id,
+                old_revision=old_revision,
+                new_revision=new_revision,
+                lo=lo,
+                hi=hi,
+                page_size=page_size,
+                start_after=None,
+            )
+
+        return {
+            "old_revision": old_revision,
+            "new_revision": new_revision,
+            "since": since_iso,
+            "until": until_iso,
+            "page_size": page_size,
+            "snapshot_id": snap_id,
+            "items": items,
+            "next_cursor": next_cursor,
+        }
+
+    def _iter_diff_items(
+        self,
+        conn: Any,
+        snap_id: str,
+        old_revision: int,
+        new_revision: int,
+        old_snaps: Dict[str, Dict[str, Any]],
+        new_snaps: Dict[str, Dict[str, Any]],
+        zone_ids: List[str],
+        lo: Optional[float],
+        hi: Optional[float],
+        start_after: Optional[Tuple[str, str]],
+    ):
+        """按 (trip_id, zone_id) 稳定顺序逐个产出发生变化的条目。"""
+        for trip_id in self.db.list_snapshot_trip_ids(conn, snap_id):
+            points = self.db.list_snapshot_trip_points(conn, snap_id, trip_id)
+            if len(points) < 2:
+                # 与单车次穿越查询契约一致：不足两点无穿越可言
+                continue
+
+            zone_cache: Dict[Tuple[str, int], Optional[Dict[str, Any]]] = {}
+
+            def crossing(zone_id: str, revision: int) -> Dict[str, Any]:
+                # 同一 (trip, zone, 版本) 的核算只做一次
+                key = (zone_id, revision)
+                if key not in zone_cache:
+                    snaps = old_snaps if revision == old_revision else new_snaps
+                    snap = snaps.get(zone_id)
+                    zone_cache[key] = (
+                        None if snap is None else self._compute_crossing(points, snap, lo, hi)
+                    )
+                cached = zone_cache[key]
+                return self._empty_crossing() if cached is None else cached
+
+            for zone_id in zone_ids:
+                if start_after is not None and (trip_id, zone_id) <= start_after:
+                    continue
+                old_result = crossing(zone_id, old_revision)
+                new_result = crossing(zone_id, new_revision)
+                if not self._crossing_changed(old_result, new_result):
+                    continue
+                yield self._build_diff_item(trip_id, zone_id, old_snaps, new_snaps, old_result, new_result)
+
+    @staticmethod
+    def _build_diff_item(
+        trip_id: str,
+        zone_id: str,
+        old_snaps: Dict[str, Dict[str, Any]],
+        new_snaps: Dict[str, Dict[str, Any]],
+        old_result: Dict[str, Any],
+        new_result: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        return {
+            "trip_id": trip_id,
+            "zone_id": zone_id,
+            "old": {
+                "zone_revision": (
+                    old_snaps[zone_id]["revision"] if zone_id in old_snaps else None
+                ),
+                **old_result,
+            },
+            "new": {
+                "zone_revision": (
+                    new_snaps[zone_id]["revision"] if zone_id in new_snaps else None
+                ),
+                **new_result,
+            },
+            "total_duration_delta_sec": round(
+                new_result["total_duration_sec"] - old_result["total_duration_sec"], 6
+            ),
+        }
+
+    def _scan_diff_page(
+        self,
+        conn: Any,
+        snap_id: str,
+        old_revision: int,
+        new_revision: int,
+        lo: Optional[float],
+        hi: Optional[float],
+        page_size: int,
+        start_after: Optional[Tuple[str, str]],
+    ) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+        """按 (trip_id, zone_id) 稳定顺序扫描快照，收集本页发生变化的条目。
+
+        返回 (items, next_cursor)：本页之后仍有变化条目时才给出游标，
+        末页（含恰好收满的末页）游标为 None。
+        """
+        # 两版区域配置：截至相应修订号的最后版本（区域在同一快照事务内取齐）
+        old_snaps = {s["zone_id"]: s for s in self.db.zone_snapshots_at_revision(conn, old_revision)}
+        new_snaps = {s["zone_id"]: s for s in self.db.zone_snapshots_at_revision(conn, new_revision)}
+        zone_ids = sorted(set(old_snaps) | set(new_snaps))
+
+        iterator = self._iter_diff_items(
+            conn, snap_id, old_revision, new_revision,
+            old_snaps, new_snaps, zone_ids, lo, hi, start_after
+        )
+        items = [next(iterator, None) for _ in range(page_size + 1)]
+        has_next = items[-1] is not None
+        items = [item for item in items if item is not None]
+        if has_next:
+            # 多取的一条不属于本页；游标指向本页最后一条
+            items = items[:page_size]
+            last = items[-1]
+            next_cursor = self._encode_cursor(snap_id, last["trip_id"], last["zone_id"])
+        else:
+            next_cursor = None
+        return items, next_cursor
+
+    @staticmethod
+    def _crossing_changed(old: Dict[str, Any], new: Dict[str, Any]) -> bool:
+        """穿越区间发生变化即视为结论变化（累计秒数由区间决定，一并返回差值）。"""
+        return old["segments"] != new["segments"]
+
+
+def _epoch_equal(a: Optional[float], b: Optional[float]) -> bool:
+    """两个可选 epoch 是否一致（None 视为同一"未提供时间过滤"）。"""
+    if a is None or b is None:
+        return a is None and b is None
+    return abs(a - b) < 1e-6

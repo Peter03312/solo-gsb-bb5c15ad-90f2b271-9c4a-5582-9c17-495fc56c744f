@@ -17,6 +17,7 @@
 - **全局修订号**：每次区域登记或同 ID 覆盖更新都在单个立即事务内占用下一个全局递增整数（`1,2,3,…`），登记响应返回 `revision`；同一修订号下写入一份区域配置（几何 + 生效时段）的**不可变快照**，事后不会改变。校验失败的登记整体回滚，**不消耗修订号**。
 - **按修订号复现**：穿越查询带 `revision=N` 时，取每个区域**截至 N 的最后版本**（last-version-as-of）核算；N 时**尚未登记的区域不参与**。沿用现有带洞边界、UTC 半开窗口与相邻点插值规则，响应额外返回所用 `revision`。不带 `revision` 的查询路径、请求字段与响应语义完全不变（走最新配置，响应不含 `revision` 字段）。
 - 修订号 `N` 不存在（尚无任何登记）或 `N` 大于当前最大修订号时返回 `404 not_found`；`revision` 非正整数由参数校验返回 `422`。
+- **跨修订号差异核对**：`GET /api/v1/crossing-diffs?old_revision=A&new_revision=B` 以**首次请求时已存的全部轨迹**为两版共同输入，分别按各区截至 `A`、`B` 的最后配置核算，仅返回**穿越区间或累计秒数发生变化**的 `(车次, 危险区)`；旧版尚未登记的区域按空结果（`crossed=false`、0 秒、空区间）比较。结果按 `(trip_id, zone_id)` 稳定分页；**首次请求会冻结轨迹与区域快照**（`snapshot_id` 随响应返回），后续页凭 `next_cursor` 沿用同一快照——之后新上传的轨迹或新登记的区域不改变本次结果，快照持久化、重启后仍可翻页。无变化时 `items` 为空列表。`old_revision >= new_revision`、非法核算时段返回 `400 validation_error`；修订号不存在返回 `404 not_found`；游标无法解析/快照不存在返回 `400 invalid_cursor`，游标与 `old_revision`/`new_revision`/`since`/`until`/`page_size` 不匹配同样返回 `400 invalid_cursor`；非正整数修订号、越界 `page_size` 返回 `422`。核算沿用带洞边界、相邻点插值与 UTC 半开规则，与单车次穿越查询完全一致。
 - **旧库迁移**：升级前已存在的区域在首次启动时一次性迁移为**基线版本**（修订号从 1 起），不推断迁移前历史；迁移为单事务、幂等，可安全重启。
 - 并发登记由数据库立即事务串行化，修订号全局唯一连续；并发查询在快照事务内取齐轨迹与区域配置，**不会读到半次提交**。
 - 非法输入明确拒绝（HTTP 400）：自交多边形、洞越出外环、洞互相重叠、非有限坐标（NaN/Infinity）、不带时区的时刻、非正长度时段等。
@@ -80,8 +81,11 @@ uvicorn app.main:app --host 0.0.0.0 --port 8080
 | POST | `/api/v1/trips/{trip_id}/points` | 批量提交/重传某车次轨迹点（原子、幂等） |
 | GET | `/api/v1/trips/{trip_id}` | 查询车次全部轨迹点（按时刻排序） |
 | GET | `/api/v1/trips/{trip_id}/crossings` | 穿越审计结果（可选 `revision` 复现历史配置） |
+| GET | `/api/v1/crossing-diffs` | 两次全局修订号之间已存车次穿越结论的差异核对（分页、快照隔离） |
 
 穿越查询参数（均可选）：`zone_id`（只看某危险区）、`since` / `until`（UTC ISO 8601，半开 `[since, until)` 时间过滤）、`revision`（正整数；取各区截至该号的最后版本，不填则使用最新配置）。
+
+差异核对参数：`old_revision`（较小旧号，必填正整数）、`new_revision`（较大新号，必填正整数，须严格大于旧号）、`since` / `until`（可选 UTC 半开核算时段）、`page_size`（每页条目数，默认 100，范围 1..1000）、`cursor`（后续页游标）。
 
 时间字符串使用 ISO 8601 且**必须带时区**，推荐以 `Z` 结尾表示 UTC，例如 `2026-09-30T12:00:00Z`。
 
@@ -225,12 +229,82 @@ curl -s http://localhost:8080/api/v1/zones/Z-A/history
 # {"zone_id":"Z-A","count":2,"versions":[{"zone_id":"Z-A","revision":1,"registered_at":"...","exterior":[...],"holes":[...],"windows":[...]}, ...]}
 ```
 
+### 5) 两次修订号之间的穿越结论差异核对
+
+危险区配置多次修订后，审计员需要核对"从旧修订号到新修订号，哪些已存车次对哪些危险区的穿越结论发生了变化"。
+
+沿用第 1、4 节的数据（rev 1 = 带洞 100m 方块 `Z-A`，rev 2 = 新登记的 `Z-B`，rev 3 = 去洞扩到 200m 的 `Z-A`）：
+
+```bash
+curl -s "http://localhost:8080/api/v1/crossing-diffs?old_revision=1&new_revision=3"
+```
+
+```json
+{
+  "old_revision": 1,
+  "new_revision": 3,
+  "since": null,
+  "until": null,
+  "page_size": 100,
+  "snapshot_id": "sahR0hjCZqPhWIAN9RSmBZqZ",
+  "items": [
+    {
+      "trip_id": "truck-7",
+      "zone_id": "Z-A",
+      "old": {
+        "zone_revision": 1,
+        "crossed": true,
+        "total_duration_sec": 68.571429,
+        "segments": [
+          {"start": "2026-09-30T12:00:17.142857Z", "end": "2026-09-30T12:00:51.428571Z", "duration_sec": 34.285714},
+          {"start": "2026-09-30T12:01:08.571429Z", "end": "2026-09-30T12:01:42.857143Z", "duration_sec": 34.285714}
+        ]
+      },
+      "new": {
+        "zone_revision": 3,
+        "crossed": true,
+        "total_duration_sec": 102.857143,
+        "segments": [
+          {"start": "2026-09-30T12:00:17.142857Z", "end": "2026-09-30T12:02:00Z", "duration_sec": 102.857143}
+        ]
+      },
+      "total_duration_delta_sec": 34.285714
+    },
+    {
+      "trip_id": "truck-7",
+      "zone_id": "Z-B",
+      "old": {"zone_revision": null, "crossed": false, "total_duration_sec": 0, "segments": []},
+      "new": {"zone_revision": 2, "crossed": true, "total_duration_sec": 85.714286, "segments": ["..."]},
+      "total_duration_delta_sec": 85.714286
+    }
+  ],
+  "next_cursor": null
+}
+```
+
+要点：
+
+- `old.zone_revision` / `new.zone_revision` 是该区域在两版核算中实际采用的版本号（各区截至相应修订号的最后版本）；旧版尚未登记时为 `null`，整侧按空结果参与比较。
+- 每条同时给出两版 `segments`（起止区间与各段秒数）、两版 `total_duration_sec` 及 `total_duration_delta_sec = new - old`；区间或累计秒数无变化的 `(车次, 区域)` 不列出，全部无变化时 `items` 为 `[]`。
+- 可选 UTC 半开核算时段：`&since=2026-09-30T12:00:30Z&until=2026-09-30T12:01:30Z`，语义与单车次穿越查询的 `since`/`until` 完全一致。
+- **快照隔离**：首次请求（不带 `cursor`）冻结当时已存轨迹并返回 `snapshot_id`；之后新上传的轨迹、新登记的区域都不影响这次核对。后续页必须原样回传 `old_revision`/`new_revision`/`since`/`until`/`page_size`，并把上一页的 `next_cursor` 透传：
+
+```bash
+# 首页（page_size 变小以演示分页）
+curl -s "http://localhost:8080/api/v1/crossing-diffs?old_revision=1&new_revision=3&page_size=50"
+# 响应中取 next_cursor，请求下一页（其余参数必须与首页一致）：
+curl -s "http://localhost:8080/api/v1/crossing-diffs?old_revision=1&new_revision=3&page_size=50&cursor=<next_cursor>"
+```
+
+末页 `next_cursor` 为 `null`；不带 `cursor` 重新请求即按当时数据建立一份新的快照（得到新的 `snapshot_id`）。
+
 ## 错误响应
 
-- `400 validation_error`：几何/时间/坐标语义非法（自交多边形、洞越界、非有限坐标、时区缺失等）。
+- `400 validation_error`：几何/时间/坐标语义非法（自交多边形、洞越界、非有限坐标、时区缺失等）；差异核对的修订号顺序错误（`old_revision >= new_revision`）、核算时段非法（`since >= until`、缺时区等）也返回此错误。
+- `400 invalid_cursor`：差异核对分页游标无法解析、对应快照不存在，或游标与本次请求的 `old_revision`/`new_revision`/`since`/`until`/`page_size` 不匹配。
 - `409 conflict`：同点 ID 异内容，或同车次同刻关联了不同点 ID。
-- `404 not_found`：危险区或车次不存在；或穿越查询指定的 `revision` 不存在 / 超出当前最大修订号。
-- `422`：请求体不符合 JSON 模式（类型错误、多余字段、缺字段），或 `revision` 不是正整数。
+- `404 not_found`：危险区或车次不存在；或穿越查询指定的 `revision` 不存在 / 超出当前最大修订号；或差异核对的修订号超出当前最大修订号。
+- `422`：请求体不符合 JSON 模式（类型错误、多余字段、缺字段），或 `revision`/`old_revision`/`new_revision` 不是正整数，或 `page_size` 超出 1..1000。
 
 ## 运行测试
 
@@ -242,7 +316,10 @@ python -m pytest -q
 测试覆盖：带洞多边形裁剪、外边界计入、洞与洞边界剔除、零时长接触、自交/洞越界拒绝、
 幂等与冲突、批量原子性、乱序重建、生效时段半开裁剪、区间合并、重启持久化；
 修订号全局递增与原子占用、按修订号复现几何/窗口、截至版本取最后版本、未登记区域排除、
-修订号越界/非法报错、失败登记不占号、并发登记唯一连续、历史版本不可变、旧库基线迁移等。
+修订号越界/非法报错、失败登记不占号、并发登记唯一连续、历史版本不可变、旧库基线迁移；
+跨修订号差异核对的变化条目与两版区间/秒数/差值、旧版未登记按空结果、无变化空列表、
+UTC 半开核算时段、(车次,区域) 稳定分页与末页无游标、快照隔离（新上传轨迹/新登记区域不影响后续页）、
+快照跨重启持久化、修订号顺序/不存在/非法报错、游标损坏/快照缺失/参数不匹配报错、page_size 边界等。
 
 ## 目录结构
 

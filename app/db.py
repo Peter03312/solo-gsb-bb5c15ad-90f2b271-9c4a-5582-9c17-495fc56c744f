@@ -79,6 +79,20 @@ CREATE TABLE IF NOT EXISTS points (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_points_trip_ts
     ON points(trip_id, ts_epoch);
 CREATE INDEX IF NOT EXISTS idx_points_trip ON points(trip_id, ts_epoch);
+
+-- 进程级元数据（如游标 HMAC 密钥），首次启动生成、重启沿用
+CREATE TABLE IF NOT EXISTS app_meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
+-- 两次修订号穿越差异核对的首次请求快照（冻结车次轨迹与两版区域配置）
+CREATE TABLE IF NOT EXISTS diff_snapshots (
+    snapshot_id  TEXT PRIMARY KEY,
+    created_at   TEXT NOT NULL,
+    params_json  TEXT NOT NULL,          -- 核算参数（两修订号/时段/分页大小）
+    payload_json TEXT NOT NULL           -- 冻结的车次轨迹与两版区域快照
+);
 """
 
 
@@ -372,6 +386,79 @@ class Database:
             "INSERT INTO points(trip_id, point_id, ts_epoch, x, y) VALUES (?,?,?,?,?)",
             rows,
         )
+
+    def list_trip_ids(self, conn: Optional[sqlite3.Connection] = None) -> List[str]:
+        c = conn or self._conn
+        return [
+            row["trip_id"]
+            for row in c.execute(
+                "SELECT DISTINCT trip_id FROM points ORDER BY trip_id"
+            ).fetchall()
+        ]
+
+    # ----- 差异核对快照 / 游标密钥 ------------------------------------------
+
+    def get_meta(self, key: str, conn: Optional[sqlite3.Connection] = None) -> Optional[str]:
+        c = conn or self._conn
+        row = c.execute("SELECT value FROM app_meta WHERE key = ?", (key,)).fetchone()
+        return None if row is None else row["value"]
+
+    def set_meta(self, conn: sqlite3.Connection, key: str, value: str) -> None:
+        conn.execute(
+            "INSERT INTO app_meta(key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, value),
+        )
+
+    def get_or_create_secret(self) -> str:
+        """游标签名密钥：首次使用时在写事务内生成并落库，之后重启沿用。"""
+        with self._lock:
+            existing = self.get_meta("cursor_secret")
+            if existing is not None:
+                return existing
+            import secrets
+
+            secret = secrets.token_hex(32)
+            with self.transaction() as conn:
+                row = conn.execute(
+                    "SELECT value FROM app_meta WHERE key = 'cursor_secret'"
+                ).fetchone()
+                if row is not None:
+                    return row["value"]
+                self.set_meta(conn, "cursor_secret", secret)
+            return secret
+
+    def insert_diff_snapshot(
+        self,
+        conn: sqlite3.Connection,
+        snapshot_id: str,
+        created_iso: str,
+        params: Dict[str, Any],
+        payload: Dict[str, Any],
+    ) -> None:
+        conn.execute(
+            "INSERT INTO diff_snapshots(snapshot_id, created_at, params_json, payload_json) "
+            "VALUES (?,?,?,?)",
+            (
+                snapshot_id,
+                created_iso,
+                json.dumps(params, ensure_ascii=False),
+                json.dumps(payload, ensure_ascii=False),
+            ),
+        )
+
+    def get_diff_snapshot(self, snapshot_id: str) -> Optional[Dict[str, Any]]:
+        row = self._conn.execute(
+            "SELECT * FROM diff_snapshots WHERE snapshot_id = ?", (snapshot_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "snapshot_id": row["snapshot_id"],
+            "created_at": row["created_at"],
+            "params": json.loads(row["params_json"]),
+            "payload": json.loads(row["payload_json"]),
+        }
 
 
 def _utc_now_iso() -> str:

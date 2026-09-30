@@ -69,6 +69,7 @@ def index() -> dict:
             "POST /api/v1/trips/{trip_id}/points",
             "GET  /api/v1/trips/{trip_id}",
             "GET  /api/v1/trips/{trip_id}/crossings",
+            "GET  /api/v1/crossing-diffs",
         ],
     }
 
@@ -153,6 +154,31 @@ def get_crossings(
 ) -> dict:
     return service.query_crossings(
         trip_id, zone_id=zone_id, since=since, until=until, revision=revision
+    )
+
+
+@app.get("/api/v1/crossing-diffs")
+def get_crossing_diffs(
+    old_revision: int = Query(
+        ..., ge=1, description="较小（较旧）的全局修订号"
+    ),
+    new_revision: int = Query(
+        ..., ge=1, description="较大（较新）的全局修订号，必须大于 old_revision"
+    ),
+    since: Optional[str] = Query(default=None, description="UTC 半开核算时段起点（含）"),
+    until: Optional[str] = Query(default=None, description="UTC 半开核算时段终点（不含）"),
+    page_size: int = Query(default=100, ge=1, le=1000, description="每页条数（1..1000）"),
+    cursor: Optional[str] = Query(
+        default=None, description="上一页返回的 next_cursor；后续页须沿用首请求全部参数"
+    ),
+) -> dict:
+    return service.crossing_diffs(
+        old_revision=old_revision,
+        new_revision=new_revision,
+        since=since,
+        until=until,
+        page_size=page_size,
+        cursor=cursor,
     )
 
 
